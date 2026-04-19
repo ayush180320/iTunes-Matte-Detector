@@ -46,8 +46,8 @@ jobs:
         $dll = Get-ChildItem "mpv_extracted\*mpv-*.dll" | Select-Object -First 1
         Copy-Item $dll.FullName -Destination "mpv-2.dll"
 
-    - name: Build Single Executable with PyInstaller
-      run: pyinstaller --noconsole --onefile --add-binary "mpv-2.dll;." --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." matte_detector.py
+      - name: Build Single Executable with PyInstaller
+        run: pyinstaller --noconsole --onefile --hidden-import mpv --add-binary "mpv-2.dll;." --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." matte_detector.py
       
     - name: Upload Single EXE
       uses: actions/upload-artifact@v4
