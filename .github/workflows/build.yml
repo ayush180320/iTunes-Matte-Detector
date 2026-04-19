@@ -1,4 +1,4 @@
-name: Build Windows EXE with FFmpeg
+name: Build Standalone Single-File App
 
 on:
   push:
@@ -29,10 +29,22 @@ jobs:
         Copy-Item "ffmpeg_extracted\*\bin\ffmpeg.exe" -Destination "."
         Copy-Item "ffmpeg_extracted\*\bin\ffprobe.exe" -Destination "."
 
-    - name: Build with PyInstaller
-      run: pyinstaller --noconsole --onefile --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --hidden-import PyQt6.QtMultimedia --hidden-import PyQt6.QtMultimediaWidgets matte_detector.py
+    - name: Download and Extract libmpv
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Download the MPV engine using GitHub CLI directly on the cloud server
+        gh release download --repo zhongfly/mpv-winbuild --pattern "*mpv-dev-x86_64*.7z" --dir mpv_dl
+        # Windows runners have 7z pre-installed. Unzip it.
+        7z x mpv_dl\*.7z -ompv_extracted
+        # Move the DLL to our main folder and rename it so python-mpv finds it
+        Copy-Item "mpv_extracted\*\libmpv-2.dll" -Destination "mpv-2.dll"
+
+    - name: Build Single Executable with PyInstaller
+      # --onefile forces everything into a single .exe
+      run: pyinstaller --noconsole --onefile --add-binary "mpv-2.dll;." --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." matte_detector.py
       
-    - name: Upload EXE Artifact
+    - name: Upload Single EXE
       uses: actions/upload-artifact@v4
       with:
         name: StudioMatteApp-Standalone
