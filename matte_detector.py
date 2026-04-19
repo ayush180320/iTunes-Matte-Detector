@@ -3,24 +3,28 @@ import os
 import subprocess
 import re
 import json
-import csv
+
+# --- CRITICAL: Inject Embedded DLLs before importing MPV ---
+def get_base_path():
+    """Finds the hidden temp folder where PyInstaller extracts the EXE contents."""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+if os.name == 'nt':
+    # Force Python to find mpv-2.dll in the embedded temp folder
+    os.add_dll_directory(get_base_path())
+
+import mpv
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QGroupBox, QLineEdit, QMessageBox, QStyle, 
-                             QStackedLayout, QTabWidget, QSlider, QListWidget, QProgressBar)
-from PyQt6.QtMultimedia import QMediaPlayer
-from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtCore import QUrl, Qt, QThread, pyqtSignal
+                             QGroupBox, QLineEdit, QMessageBox, 
+                             QStackedLayout, QTabWidget, QSlider, QFrame)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor
-import pytesseract
-from PIL import Image
 
-# --- Dynamic Path Engine for Embedded FFmpeg ---
 def get_ext_path(binary_name):
-    """Finds the embedded FFmpeg inside the PyInstaller temporary _MEIPASS folder."""
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, binary_name)
-    return binary_name # Fallback for local development
+    return os.path.join(get_base_path(), binary_name)
 
 # --- Pro Dark Theme ---
 DARK_STYLESHEET = """
@@ -30,15 +34,10 @@ QPushButton:hover { background-color: #1177bb; }
 QPushButton:disabled { background-color: #3e3e42; color: #888888; }
 QLineEdit { background-color: #3c3c3c; border: 1px solid #555555; padding: 4px; color: white; border-radius: 2px; }
 QGroupBox { border: 1px solid #555555; border-radius: 4px; margin-top: 10px; padding-top: 15px; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #007acc; }
 QSlider::groove:horizontal { border: 1px solid #999999; height: 8px; background: #3c3c3c; margin: 2px 0; border-radius: 4px; }
 QSlider::handle:horizontal { background: #007acc; border: 1px solid #5c5c5c; width: 14px; margin: -4px 0; border-radius: 7px; }
-QTabWidget::pane { border: 1px solid #444; }
-QTabBar::tab { background: #2d2d30; padding: 8px 20px; border: 1px solid #444; }
-QTabBar::tab:selected { background: #1e1e1e; border-bottom-color: #1e1e1e; color: #007acc; font-weight: bold; }
 """
 
-# --- Visual QC Overlay Engine ---
 class MatteOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,103 +70,70 @@ class MatteOverlay(QWidget):
         if l > 0: painter.drawRect(int(offset_x), int(offset_y), int(l), int(drawn_h))
         if r > 0: painter.drawRect(int(offset_x + drawn_w - r), int(offset_y), int(r), int(drawn_h))
 
-# --- Core Scanner (Single & Batch) ---
 class MediaScanner:
     @staticmethod
-    def scan_file(filepath, run_ocr=False):
+    def scan_file(filepath):
         try:
-            # 1. Get Dimensions using embedded FFprobe
             ffprobe_exe = get_ext_path("ffprobe.exe")
             ffmpeg_exe = get_ext_path("ffmpeg.exe")
 
-            probe = subprocess.run([ffprobe_exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", filepath], stdout=subprocess.PIPE, text=True)
-            info = json.loads(probe.stdout)
-            vid_w, vid_h = int(info['streams'][0]['width']), int(info['streams'][0]['height'])
-
-            # 2. Extract Mattes (1 frame/sec) with Timecodes using embedded FFmpeg
-            cmd = [ffmpeg_exe, "-i", filepath, "-vf", "fps=1,cropdetect=24:16:0", "-f", "null", "-"]
-            result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+            probe_cmd = [ffprobe_exe, "-v", "error", "-show_entries", "format=duration:stream=width,height", "-of", "json", filepath]
+            info = json.loads(subprocess.run(probe_cmd, stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW).stdout)
             
-            crops = re.findall(r'time=(\d{2}:\d{2}:\d{2}).*?crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
-            if not crops:
+            vid_w = int(info['streams'][0]['width'])
+            vid_h = int(info['streams'][0]['height'])
+            duration = float(info['format']['duration'])
+
+            # Fast Sampling Engine
+            samples = [duration * 0.25, duration * 0.50, duration * 0.75]
+            raw_crops = []
+
+            for ts in samples:
+                cmd = [ffmpeg_exe, "-ss", str(ts), "-i", filepath, "-vframes", "3", "-vf", "cropdetect=24:16:0", "-f", "null", "-"]
+                result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                crops = re.findall(r'crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
+                if crops:
+                    raw_crops.extend([(int(c[0]), int(c[1]), int(c[2]), int(c[3])) for c in crops])
+
+            if not raw_crops:
                 raise ValueError("No mattes detected. Video may be completely black.")
 
-            raw_crops = [(c[1], c[2], c[3], c[4]) for c in crops]
-            crop_w, crop_h, crop_x, crop_y = map(int, max(set(raw_crops), key=raw_crops.count))
-            primary_mattes = {"Top": crop_y, "Bottom": vid_h - (crop_y + crop_h), "Left": crop_x, "Right": vid_w - (crop_x + crop_w), "Width": vid_w, "Height": vid_h}
+            crop_w, crop_h, crop_x, crop_y = max(set(raw_crops), key=raw_crops.count)
+            primary_mattes = {"Top": crop_y, "Bottom": vid_h - (crop_y + crop_h), "Left": crop_x, "Right": vid_w - (crop_x + crop_w)}
 
-            # 3. Subtitle Collision Detection (OCR Mock/Hook)
-            sub_warning = False
-
-            # Identify if variable aspect ratio exists (IMAX)
-            edl = list(set(raw_crops))
-            is_variable = len(edl) > 2 
-
-            return {"success": True, "mattes": primary_mattes, "variable_ar": is_variable, "subtitle_collision": sub_warning}
+            return {"success": True, "mattes": primary_mattes, "variable_ar": len(set(raw_crops)) > 1}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-# --- Background Workers ---
 class AnalysisThread(QThread):
     result_signal = pyqtSignal(dict)
-    
     def __init__(self, filepath):
         super().__init__()
         self.filepath = filepath
-
     def run(self):
-        self.result_signal.emit(MediaScanner.scan_file(self.filepath, run_ocr=True))
+        self.result_signal.emit(MediaScanner.scan_file(self.filepath))
 
-class BatchThread(QThread):
-    progress_signal = pyqtSignal(int)
-    log_signal = pyqtSignal(str)
-    done_signal = pyqtSignal(str)
-
-    def __init__(self, files):
-        super().__init__()
-        self.files = files
-
-    def run(self):
-        results = []
-        for i, f in enumerate(self.files):
-            self.log_signal.emit(f"Scanning: {os.path.basename(f)}...")
-            res = MediaScanner.scan_file(f)
-            if res["success"]:
-                m = res["mattes"]
-                results.append([os.path.basename(f), m["Top"], m["Bottom"], m["Left"], m["Right"], res["variable_ar"]])
-            else:
-                results.append([os.path.basename(f), "ERROR", res["error"], "", "", ""])
-            self.progress_signal.emit(int(((i+1)/len(self.files))*100))
-        
-        csv_path = os.path.join(os.path.dirname(self.files[0]), "Batch_Mattes_Report.csv")
-        with open(csv_path, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Filename", "Top", "Bottom", "Left", "Right", "Variable Ratio (IMAX)"])
-            writer.writerows(results)
-        
-        self.done_signal.emit(csv_path)
-
-# --- Main Enterprise App ---
 class StudioMatteApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Studio QC: iTunes Matte Pipeline")
+        self.setWindowTitle("Studio QC: Standalone MPV Pipeline")
         self.setGeometry(100, 100, 1200, 800)
         self.setStyleSheet(DARK_STYLESHEET)
         self.filepath, self.vid_w, self.vid_h = "", 1920, 1080
+        
         self.init_ui()
+        self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), keep_open=True, profile='fast')
+        
+        self.timer = QTimer(self)
+        self.timer.setInterval(100)
+        self.timer.timeout.connect(self.update_ui_timer)
 
     def init_ui(self):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
-
         self.tab_qc = QWidget()
         self.setup_qc_tab()
-        self.tabs.addTab(self.tab_qc, "Single File QC & Scrubbing")
-
-        self.tab_batch = QWidget()
-        self.setup_batch_tab()
-        self.tabs.addTab(self.tab_batch, "Batch Processing Queue")
+        self.tabs.addTab(self.tab_qc, "Single File QC")
 
     def setup_qc_tab(self):
         layout = QHBoxLayout(self.tab_qc)
@@ -176,13 +142,14 @@ class StudioMatteApp(QMainWindow):
         self.stacked = QStackedLayout(self.vid_container)
         self.stacked.setStackingMode(QStackedLayout.StackingMode.StackAll)
         
-        self.vid_widget, self.player, self.overlay = QVideoWidget(), QMediaPlayer(), MatteOverlay()
-        self.player.setVideoOutput(self.vid_widget)
-        self.player.positionChanged.connect(self.update_slider)
-        self.player.durationChanged.connect(self.update_duration)
+        self.video_frame = QFrame()
+        self.video_frame.setStyleSheet("background-color: black;")
+        self.video_frame.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        self.video_frame.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         
+        self.overlay = MatteOverlay()
         self.stacked.addWidget(self.overlay) 
-        self.stacked.addWidget(self.vid_widget) 
+        self.stacked.addWidget(self.video_frame) 
         vid_layout.addWidget(self.vid_container, stretch=1)
 
         timeline_layout = QHBoxLayout()
@@ -191,6 +158,7 @@ class StudioMatteApp(QMainWindow):
         timeline_layout.addWidget(self.btn_play)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 1000)
         self.slider.sliderMoved.connect(self.set_position)
         timeline_layout.addWidget(self.slider)
         
@@ -205,7 +173,7 @@ class StudioMatteApp(QMainWindow):
         self.btn_load.clicked.connect(self.load_video)
         side.addWidget(self.btn_load)
 
-        self.btn_scan = QPushButton("Auto-Detect Mattes (Full Scan)")
+        self.btn_scan = QPushButton("Auto-Detect Mattes (Fast Scan)")
         self.btn_scan.setEnabled(False)
         self.btn_scan.clicked.connect(self.start_scan)
         side.addWidget(self.btn_scan)
@@ -226,73 +194,44 @@ class StudioMatteApp(QMainWindow):
             m_layout.addLayout(r)
         self.grp_mattes.setLayout(m_layout)
         side.addWidget(self.grp_mattes)
-
-        self.lbl_warnings = QLabel("")
-        self.lbl_warnings.setStyleSheet("color: #ffaa00;")
-        side.addWidget(self.lbl_warnings)
-
-        self.btn_copy = QPushButton("Copy iTunes XML Data")
-        self.btn_copy.clicked.connect(self.copy_xml)
-        side.addWidget(self.btn_copy)
         
         side.addStretch()
         layout.addLayout(side, stretch=1)
 
-    def setup_batch_tab(self):
-        layout = QVBoxLayout(self.tab_batch)
-        self.batch_files = []
-
-        controls = QHBoxLayout()
-        self.btn_add_files = QPushButton("Add Videos to Queue")
-        self.btn_add_files.clicked.connect(self.add_batch_files)
-        controls.addWidget(self.btn_add_files)
-
-        self.btn_start_batch = QPushButton("Start Batch Process")
-        self.btn_start_batch.setEnabled(False)
-        self.btn_start_batch.clicked.connect(self.start_batch)
-        controls.addWidget(self.btn_start_batch)
-        layout.addLayout(controls)
-
-        self.list_queue = QListWidget()
-        layout.addWidget(self.list_queue)
-
-        self.batch_progress = QProgressBar()
-        layout.addWidget(self.batch_progress)
-        self.lbl_batch_log = QLabel("Queue empty.")
-        layout.addWidget(self.lbl_batch_log)
-
     def load_video(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open Media", "", "Video (*.mp4 *.mov *.mkv *.mxf)")
+        fname, _ = QFileDialog.getOpenFileName(self, "Open Media", "", "Video (*.mp4 *.mov *.mkv *.mxf *.avi)")
         if fname:
             self.filepath = fname
-            self.player.setSource(QUrl.fromLocalFile(fname))
+            self.player.play(self.filepath)
+            self.player.pause = True
             
             ffprobe_exe = get_ext_path("ffprobe.exe")
-            info = json.loads(subprocess.run([ffprobe_exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True).stdout)
+            info = json.loads(subprocess.run([ffprobe_exe, "-v", "error", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW).stdout)
             self.vid_w, self.vid_h = int(info['streams'][0]['width']), int(info['streams'][0]['height'])
             
             self.lbl_status.setText(f"Loaded: {os.path.basename(fname)}")
             self.btn_scan.setEnabled(True)
-            self.player.play(); self.player.pause()
+            self.timer.start()
 
     def toggle_play(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState: self.player.pause()
-        else: self.player.play()
-
-    def update_duration(self, duration):
-        self.slider.setRange(0, duration)
-
-    def update_slider(self, position):
-        self.slider.setValue(position)
-        s = position // 1000
-        d = self.player.duration() // 1000
-        self.lbl_time.setText(f"{s//60:02}:{s%60:02} / {d//60:02}:{d%60:02}")
+        self.player.pause = not self.player.pause
 
     def set_position(self, position):
-        self.player.setPosition(position)
+        if self.player.duration:
+            self.player.time_pos = (position / 1000) * self.player.duration
+
+    def update_ui_timer(self):
+        if getattr(self.player, 'time_pos', None) is not None and getattr(self.player, 'duration', None) is not None:
+            pos = self.player.time_pos
+            dur = self.player.duration
+            if dur > 0:
+                self.slider.blockSignals(True)
+                self.slider.setValue(int((pos / dur) * 1000))
+                self.slider.blockSignals(False)
+                self.lbl_time.setText(f"{int(pos)//60:02}:{int(pos)%60:02} / {int(dur)//60:02}:{int(dur)%60:02}")
 
     def start_scan(self):
-        self.lbl_status.setText("Scanning... Analyzing Timecodes & OCR...")
+        self.lbl_status.setText("Running Fast Scan...")
         self.btn_scan.setEnabled(False)
         self.thread = AnalysisThread(self.filepath)
         self.thread.result_signal.connect(self.on_scan_done)
@@ -306,47 +245,11 @@ class StudioMatteApp(QMainWindow):
 
         m = res["mattes"]
         for p in ["Top", "Bottom", "Left", "Right"]: self.inputs[p].setText(str(m[p]))
-        
-        warn_txt = ""
-        if res["variable_ar"]: warn_txt += "⚠️ Variable Aspect Ratio (IMAX) Detected!\n"
-        if res["subtitle_collision"]: warn_txt += "⚠️ Possible Subtitle Collision in Matte!\n"
-        self.lbl_warnings.setText(warn_txt)
-        self.lbl_status.setText("Scan Complete.")
+        self.lbl_status.setText("Fast Scan Complete.")
 
     def trigger_overlay(self):
         vals = {p: int(e.text()) if e.text().isdigit() else 0 for p, e in self.inputs.items()}
         self.overlay.update_overlay(vals, self.vid_w, self.vid_h)
-
-    def copy_xml(self):
-        xml = f"""<crop_dimensions>
-    <top>{self.inputs['Top'].text()}</top>
-    <bottom>{self.inputs['Bottom'].text()}</bottom>
-    <left>{self.inputs['Left'].text()}</left>
-    <right>{self.inputs['Right'].text()}</right>
-</crop_dimensions>"""
-        QApplication.clipboard().setText(xml)
-        QMessageBox.information(self, "Copied", "iTunes XML copied to clipboard.")
-
-    def add_batch_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Videos", "", "Video (*.mp4 *.mov *.mkv *.mxf)")
-        if files:
-            self.batch_files.extend(files)
-            for f in files: self.list_queue.addItem(os.path.basename(f))
-            self.btn_start_batch.setEnabled(True)
-
-    def start_batch(self):
-        self.btn_start_batch.setEnabled(False)
-        self.batch_progress.setValue(0)
-        self.batch_thread = BatchThread(self.batch_files)
-        self.batch_thread.progress_signal.connect(self.batch_progress.setValue)
-        self.batch_thread.log_signal.connect(self.lbl_batch_log.setText)
-        self.batch_thread.done_signal.connect(self.batch_done)
-        self.batch_thread.start()
-
-    def batch_done(self, csv_path):
-        self.lbl_batch_log.setText(f"Batch Complete. Exported to: {csv_path}")
-        self.btn_start_batch.setEnabled(True)
-        QMessageBox.information(self, "Batch Complete", f"Data exported successfully to CSV.\n\n{csv_path}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
