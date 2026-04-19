@@ -4,7 +4,6 @@ import subprocess
 import re
 import json
 import csv
-import shutil
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QGroupBox, QLineEdit, QMessageBox, QStyle, 
@@ -15,6 +14,13 @@ from PyQt6.QtCore import QUrl, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor
 import pytesseract
 from PIL import Image
+
+# --- Dynamic Path Engine for Embedded FFmpeg ---
+def get_ext_path(binary_name):
+    """Finds the embedded FFmpeg inside the PyInstaller temporary _MEIPASS folder."""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, binary_name)
+    return binary_name # Fallback for local development
 
 # --- Pro Dark Theme ---
 DARK_STYLESHEET = """
@@ -70,34 +76,28 @@ class MediaScanner:
     @staticmethod
     def scan_file(filepath, run_ocr=False):
         try:
-            # 1. Get Dimensions
-            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", filepath], stdout=subprocess.PIPE, text=True)
+            # 1. Get Dimensions using embedded FFprobe
+            ffprobe_exe = get_ext_path("ffprobe.exe")
+            ffmpeg_exe = get_ext_path("ffmpeg.exe")
+
+            probe = subprocess.run([ffprobe_exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", filepath], stdout=subprocess.PIPE, text=True)
             info = json.loads(probe.stdout)
             vid_w, vid_h = int(info['streams'][0]['width']), int(info['streams'][0]['height'])
 
-            # 2. Extract Mattes (1 frame/sec) with Timecodes
-            cmd = ["ffmpeg", "-i", filepath, "-vf", "fps=1,cropdetect=24:16:0", "-f", "null", "-"]
+            # 2. Extract Mattes (1 frame/sec) with Timecodes using embedded FFmpeg
+            cmd = [ffmpeg_exe, "-i", filepath, "-vf", "fps=1,cropdetect=24:16:0", "-f", "null", "-"]
             result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
             
-            # EDL Logic: Group by timecode to detect Variable Aspect Ratios
             crops = re.findall(r'time=(\d{2}:\d{2}:\d{2}).*?crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
             if not crops:
                 raise ValueError("No mattes detected. Video may be completely black.")
 
-            # Find primary global crop (most frequent)
             raw_crops = [(c[1], c[2], c[3], c[4]) for c in crops]
             crop_w, crop_h, crop_x, crop_y = map(int, max(set(raw_crops), key=raw_crops.count))
             primary_mattes = {"Top": crop_y, "Bottom": vid_h - (crop_y + crop_h), "Left": crop_x, "Right": vid_w - (crop_x + crop_w), "Width": vid_w, "Height": vid_h}
 
             # 3. Subtitle Collision Detection (OCR Mock/Hook)
             sub_warning = False
-            if run_ocr and primary_mattes["Bottom"] > 0:
-                # In production, we extract the bottom matte area using FFmpeg -vf crop and run pytesseract.
-                # Example hook:
-                # img = Image.open('extracted_matte.jpg')
-                # text = pytesseract.image_to_string(img)
-                # if text.strip(): sub_warning = True
-                sub_warning = False # Placeholder to prevent crash if Tesseract isn't installed natively.
 
             # Identify if variable aspect ratio exists (IMAX)
             edl = list(set(raw_crops))
@@ -139,7 +139,6 @@ class BatchThread(QThread):
                 results.append([os.path.basename(f), "ERROR", res["error"], "", "", ""])
             self.progress_signal.emit(int(((i+1)/len(self.files))*100))
         
-        # Export CSV
         csv_path = os.path.join(os.path.dirname(self.files[0]), "Batch_Mattes_Report.csv")
         with open(csv_path, 'w', newline='') as file:
             writer = csv.writer(file)
@@ -157,22 +156,15 @@ class StudioMatteApp(QMainWindow):
         self.setStyleSheet(DARK_STYLESHEET)
         self.filepath, self.vid_w, self.vid_h = "", 1920, 1080
         self.init_ui()
-        self.check_env()
-
-    def check_env(self):
-        if not shutil.which("ffmpeg"):
-            QMessageBox.critical(self, "System Error", "FFmpeg is missing from PATH. Core processing will fail.")
 
     def init_ui(self):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # TAB 1: QC Player
         self.tab_qc = QWidget()
         self.setup_qc_tab()
         self.tabs.addTab(self.tab_qc, "Single File QC & Scrubbing")
 
-        # TAB 2: Batch Queue
         self.tab_batch = QWidget()
         self.setup_batch_tab()
         self.tabs.addTab(self.tab_batch, "Batch Processing Queue")
@@ -180,7 +172,6 @@ class StudioMatteApp(QMainWindow):
     def setup_qc_tab(self):
         layout = QHBoxLayout(self.tab_qc)
 
-        # Video Area
         vid_layout, self.vid_container = QVBoxLayout(), QWidget()
         self.stacked = QStackedLayout(self.vid_container)
         self.stacked.setStackingMode(QStackedLayout.StackingMode.StackAll)
@@ -194,7 +185,6 @@ class StudioMatteApp(QMainWindow):
         self.stacked.addWidget(self.vid_widget) 
         vid_layout.addWidget(self.vid_container, stretch=1)
 
-        # Scrubbing Timeline & Controls
         timeline_layout = QHBoxLayout()
         self.btn_play = QPushButton("Play/Pause")
         self.btn_play.clicked.connect(self.toggle_play)
@@ -210,7 +200,6 @@ class StudioMatteApp(QMainWindow):
 
         layout.addLayout(vid_layout, stretch=3)
 
-        # Control Panel
         side = QVBoxLayout()
         self.btn_load = QPushButton("Load Video")
         self.btn_load.clicked.connect(self.load_video)
@@ -272,14 +261,16 @@ class StudioMatteApp(QMainWindow):
         self.lbl_batch_log = QLabel("Queue empty.")
         layout.addWidget(self.lbl_batch_log)
 
-    # --- Player Logic ---
     def load_video(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Open Media", "", "Video (*.mp4 *.mov *.mkv *.mxf)")
         if fname:
             self.filepath = fname
             self.player.setSource(QUrl.fromLocalFile(fname))
-            info = json.loads(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True).stdout)
+            
+            ffprobe_exe = get_ext_path("ffprobe.exe")
+            info = json.loads(subprocess.run([ffprobe_exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True).stdout)
             self.vid_w, self.vid_h = int(info['streams'][0]['width']), int(info['streams'][0]['height'])
+            
             self.lbl_status.setText(f"Loaded: {os.path.basename(fname)}")
             self.btn_scan.setEnabled(True)
             self.player.play(); self.player.pause()
@@ -300,7 +291,6 @@ class StudioMatteApp(QMainWindow):
     def set_position(self, position):
         self.player.setPosition(position)
 
-    # --- Scanning & UI Logic ---
     def start_scan(self):
         self.lbl_status.setText("Scanning... Analyzing Timecodes & OCR...")
         self.btn_scan.setEnabled(False)
@@ -337,7 +327,6 @@ class StudioMatteApp(QMainWindow):
         QApplication.clipboard().setText(xml)
         QMessageBox.information(self, "Copied", "iTunes XML copied to clipboard.")
 
-    # --- Batch Logic ---
     def add_batch_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Videos", "", "Video (*.mp4 *.mov *.mkv *.mxf)")
         if files:
