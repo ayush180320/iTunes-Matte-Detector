@@ -4,16 +4,21 @@ import subprocess
 import re
 import json
 
-# --- CRITICAL: Inject Embedded DLLs before importing MPV ---
+# --- CRITICAL: Route dead console outputs to devnull to prevent PyInstaller crashes ---
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
+# --- Inject Embedded DLLs ---
 def get_base_path():
-    """Finds the hidden temp folder where PyInstaller extracts the EXE contents."""
     if hasattr(sys, '_MEIPASS'):
         return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
 
 if os.name == 'nt':
-    # Force Python to find mpv-2.dll in the embedded temp folder
     os.add_dll_directory(get_base_path())
+    os.environ["PATH"] = get_base_path() + os.pathsep + os.environ.get("PATH", "")
 
 import mpv
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -26,7 +31,8 @@ from PyQt6.QtGui import QPainter, QColor
 def get_ext_path(binary_name):
     return os.path.join(get_base_path(), binary_name)
 
-# --- Pro Dark Theme ---
+CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
 DARK_STYLESHEET = """
 QMainWindow, QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Arial; }
 QPushButton { background-color: #0e639c; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold; }
@@ -39,9 +45,12 @@ QSlider::handle:horizontal { background: #007acc; border: 1px solid #5c5c5c; wid
 """
 
 class MatteOverlay(QWidget):
+    # Signal to send real video coordinates to the UI for manual testing
+    mouse_moved = pyqtSignal(int, int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setMouseTracking(True) # Enable hover tracking
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.mattes = {"Top": 0, "Bottom": 0, "Left": 0, "Right": 0}
         self.vid_w, self.vid_h = 1920, 1080
@@ -50,6 +59,22 @@ class MatteOverlay(QWidget):
         self.mattes = mattes
         self.vid_w, self.vid_h = max(1, vid_w), max(1, vid_h)
         self.update()
+
+    def mouseMoveEvent(self, event):
+        """Calculates true video pixel coordinates for manual matte measurement."""
+        if self.vid_w == 0: return
+        scale = min(self.width() / self.vid_w, self.height() / self.vid_h)
+        drawn_w, drawn_h = self.vid_w * scale, self.vid_h * scale
+        offset_x, offset_y = (self.width() - drawn_w) / 2, (self.height() - drawn_h) / 2
+        
+        real_x = int((event.position().x() - offset_x) / scale)
+        real_y = int((event.position().y() - offset_y) / scale)
+        
+        # Clamp to bounds
+        real_x = max(0, min(self.vid_w, real_x))
+        real_y = max(0, min(self.vid_h, real_y))
+        
+        self.mouse_moved.emit(real_x, real_y)
 
     def paintEvent(self, event):
         if not self.isVisible() or self.vid_w == 0: return
@@ -78,19 +103,18 @@ class MediaScanner:
             ffmpeg_exe = get_ext_path("ffmpeg.exe")
 
             probe_cmd = [ffprobe_exe, "-v", "error", "-show_entries", "format=duration:stream=width,height", "-of", "json", filepath]
-            info = json.loads(subprocess.run(probe_cmd, stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW).stdout)
+            info = json.loads(subprocess.run(probe_cmd, stdout=subprocess.PIPE, text=True, creationflags=CREATE_NO_WINDOW).stdout)
             
             vid_w = int(info['streams'][0]['width'])
             vid_h = int(info['streams'][0]['height'])
             duration = float(info['format']['duration'])
 
-            # Fast Sampling Engine
             samples = [duration * 0.25, duration * 0.50, duration * 0.75]
             raw_crops = []
 
             for ts in samples:
                 cmd = [ffmpeg_exe, "-ss", str(ts), "-i", filepath, "-vframes", "3", "-vf", "cropdetect=24:16:0", "-f", "null", "-"]
-                result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, creationflags=CREATE_NO_WINDOW)
                 crops = re.findall(r'crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
                 if crops:
                     raw_crops.extend([(int(c[0]), int(c[1]), int(c[2]), int(c[3])) for c in crops])
@@ -116,13 +140,21 @@ class AnalysisThread(QThread):
 class StudioMatteApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Studio QC: Standalone MPV Pipeline")
+        self.setWindowTitle("Studio QC: Pro Media Player")
         self.setGeometry(100, 100, 1200, 800)
         self.setStyleSheet(DARK_STYLESHEET)
         self.filepath, self.vid_w, self.vid_h = "", 1920, 1080
         
         self.init_ui()
-        self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), keep_open=True, profile='fast')
+        
+        # CRITICAL MPV FIX: 'terminal=no' prevents the background console crash
+        self.player = mpv.MPV(
+            wid=str(int(self.video_frame.winId())), 
+            keep_open=True, 
+            profile='fast',
+            terminal='no',
+            hwdec='auto'
+        )
         
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -148,14 +180,25 @@ class StudioMatteApp(QMainWindow):
         self.video_frame.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         
         self.overlay = MatteOverlay()
+        self.overlay.mouse_moved.connect(self.update_mouse_coords)
         self.stacked.addWidget(self.overlay) 
         self.stacked.addWidget(self.video_frame) 
         vid_layout.addWidget(self.vid_container, stretch=1)
 
+        # Full Media Controls
         timeline_layout = QHBoxLayout()
-        self.btn_play = QPushButton("Play/Pause")
+        
+        self.btn_play = QPushButton("▶ Play/Pause")
         self.btn_play.clicked.connect(self.toggle_play)
         timeline_layout.addWidget(self.btn_play)
+
+        self.btn_prev = QPushButton("|< Frame")
+        self.btn_prev.clicked.connect(lambda: self.player.command('frame-back-step'))
+        timeline_layout.addWidget(self.btn_prev)
+
+        self.btn_next = QPushButton("Frame >|")
+        self.btn_next.clicked.connect(lambda: self.player.command('frame-step'))
+        timeline_layout.addWidget(self.btn_next)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
@@ -173,13 +216,22 @@ class StudioMatteApp(QMainWindow):
         self.btn_load.clicked.connect(self.load_video)
         side.addWidget(self.btn_load)
 
-        self.btn_scan = QPushButton("Auto-Detect Mattes (Fast Scan)")
+        self.btn_scan = QPushButton("Auto-Detect Mattes")
         self.btn_scan.setEnabled(False)
         self.btn_scan.clicked.connect(self.start_scan)
         side.addWidget(self.btn_scan)
 
         self.lbl_status = QLabel("Ready")
         side.addWidget(self.lbl_status)
+
+        # Manual Testing Readout
+        self.grp_manual = QGroupBox("Manual Pixel Inspector")
+        manual_layout = QVBoxLayout()
+        self.lbl_coords = QLabel("Hover video to inspect pixels\nX: 0 | Y: 0")
+        self.lbl_coords.setStyleSheet("color: #4da6ff; font-family: monospace;")
+        manual_layout.addWidget(self.lbl_coords)
+        self.grp_manual.setLayout(manual_layout)
+        side.addWidget(self.grp_manual)
 
         self.grp_mattes = QGroupBox("Matte Overrides")
         m_layout = QVBoxLayout()
@@ -206,12 +258,18 @@ class StudioMatteApp(QMainWindow):
             self.player.pause = True
             
             ffprobe_exe = get_ext_path("ffprobe.exe")
-            info = json.loads(subprocess.run([ffprobe_exe, "-v", "error", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW).stdout)
+            info = json.loads(subprocess.run([ffprobe_exe, "-v", "error", "-show_entries", "stream=width,height", "-of", "json", self.filepath], stdout=subprocess.PIPE, text=True, creationflags=CREATE_NO_WINDOW).stdout)
             self.vid_w, self.vid_h = int(info['streams'][0]['width']), int(info['streams'][0]['height'])
             
             self.lbl_status.setText(f"Loaded: {os.path.basename(fname)}")
             self.btn_scan.setEnabled(True)
             self.timer.start()
+            
+            # Sync overlay with new resolution
+            self.trigger_overlay()
+
+    def update_mouse_coords(self, x, y):
+        self.lbl_coords.setText(f"Hover video to inspect pixels\nX: {x} | Y: {y}")
 
     def toggle_play(self):
         self.player.pause = not self.player.pause
